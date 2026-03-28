@@ -8,13 +8,13 @@ import java.util.Random;
 public class GibbsScheduler {
 
     public static class MECSystemParams {
-        public double W = 5e6; // 5 MHz bandwidth
+        public double W = 2e6; // 2 MHz bandwidth
         public double sigma2 = 1e-10; // noise power
         public double P_peak = 0.1; // 100 mW max transmit power
-        public double f_peak = 50e6; // 50 MHz — mid-range IoT (ESP32-class)
+        public double f_peak = 100e6; // 100 MHz
         public double f_c = 1e10; // 10 GHz edge server CPU
         public double P0 = 1.0; // AP downlink transmit power
-        public double kappa = 1e-26; // effective capacitance coefficient
+        public double kappa = 1e-26; // computing efficiency
     }
 
     public static class WirelessDeviceWrapper {

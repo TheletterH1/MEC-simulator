@@ -30,7 +30,8 @@ import org.javatuples.Ennead;
 
 public class SimulatorExecution {
 
-	static java.util.Map<String, Integer> gibbsPolicies = new java.util.HashMap<>();
+	public static java.util.Map<String, Integer> gibbsPolicies = new java.util.HashMap<>();
+	public static double gibbsBestObj = 0.0;
 
 	static int CORE_FREE = 1;
 	static int CORE_OCCUPIED = 2;
@@ -145,10 +146,11 @@ public class SimulatorExecution {
 						gibbsPolicies.clear(); // Reset for new loop
 						long[] randLoadList = new long[numberTasks];
 						long[] randDataList = new long[numberTasks];
+						long minLoad = (long) (10 * Math.pow(10, 6)); // 10 Mcycles
+						long maxLoad = (long) (200 * Math.pow(10, 6)); // 200 Mcycles
 						for (int i = 0; i < numberTasks; i++) {
-							double loadFactor = 0.5 + rand.nextDouble();
-							randLoadList[i] = (long) (app.getComputationalLoad() * loadFactor);
-							randDataList[i] = (long) (app.getDataEntrySize() * loadFactor);
+							randLoadList[i] = minLoad + (long) (rand.nextDouble() * (maxLoad - minLoad));
+							randDataList[i] = (long) (1 * 8 * Math.pow(10, 6)); // Fix data to 1MB
 						}
 
 						if (numberIoTDevices == 2) {
@@ -221,26 +223,28 @@ public class SimulatorExecution {
 									wd2Tasks.add(t);
 							}
 							GibbsScheduler.MECSystemParams sysParam = new GibbsScheduler.MECSystemParams();
-							// Time-varying channels: model device moving closer to AP over time
-							// WD1: distance decreases from 100m to 30m across its tasks
+							// Paper Fig 8/9 setup: d1=15m, d2=10m.
+							double d1 = 15.0;
 							double[] h1 = new double[wd1Tasks.size() + 1];
-							for (int i = 0; i <= wd1Tasks.size(); i++) {
-								double dist = 100.0 - (70.0 * i / wd1Tasks.size()); // 100m -> 30m
-								h1[i] = GibbsScheduler.freeSpaceChannel(dist, 4.11, 915e6, 3.0);
-							}
-							// WD2: distance decreases from 120m to 40m
+							Arrays.fill(h1, GibbsScheduler.freeSpaceChannel(d1, 4.11, 915e6, 3.0));
+
+							double d2 = 10.0;
 							double[] h2 = new double[wd2Tasks.size() + 1];
-							for (int i = 0; i <= wd2Tasks.size(); i++) {
-								double dist = 120.0 - (80.0 * i / wd2Tasks.size()); // 120m -> 40m
-								h2[i] = GibbsScheduler.freeSpaceChannel(dist, 4.11, 915e6, 3.0);
-							}
+							Arrays.fill(h2, GibbsScheduler.freeSpaceChannel(d2, 4.11, 915e6, 3.0));
+
 							GibbsScheduler.WirelessDeviceWrapper wd1Wrap = new GibbsScheduler.WirelessDeviceWrapper(
 									listOfIoTDevices[0], wd1Tasks, h1, h1);
+							wd1Wrap.beta_T = 0.05; // Fig 8 settings
+							wd1Wrap.beta_E = 0.95;
+
 							GibbsScheduler.WirelessDeviceWrapper wd2Wrap = new GibbsScheduler.WirelessDeviceWrapper(
 									listOfIoTDevices[1], wd2Tasks, h2, h2);
+							wd2Wrap.beta_T = 0.50;
+							wd2Wrap.beta_E = 0.50;
 
 							GibbsScheduler.GibbsResult gRes = GibbsScheduler.gibbsSampling(wd1Wrap, wd2Wrap, k,
 									sysParam, 1.0, 0.95, 500, 1e-6, 42);
+							gibbsBestObj = gRes.bestObj;
 							for (int j = 0; j < M; j++)
 								gibbsPolicies.put(wd1Tasks.get(j).getIdTask(),
 										gRes.a1[j] == 0 ? POLICY1_IOT : POLICY2_MEC);
@@ -460,6 +464,8 @@ public class SimulatorExecution {
 		filename = filename + "-" + testType + ".txt";
 
 		BufferedWriter writer = new BufferedWriter(new FileWriter(filename));
+		writer.write("# Total ETC (Gibbs Best OBJ): " + gibbsBestObj + "\n");
+
 		String header = "Time;Task-ID;Device;Policy;Finalization Status;CPU core Energy;Transfer Energy;CPU core Time;Transfer Time;Cost\n";
 		writer.write(header);
 
@@ -516,6 +522,7 @@ public class SimulatorExecution {
 
 		BufferedWriter writer = new BufferedWriter(new FileWriter(filename));
 
+		writer.write("# Total ETC (Gibbs Best OBJ): " + gibbsBestObj + "\n");
 		writer.write(header);
 		for (Ennead<Long, String, String, String, Long, Long, Long, Long, Long> ennead : listEnnead) {
 			writer.write(ennead.getValue0() + ";" + ennead.getValue1() + ";" + ennead.getValue2() + ";" +
