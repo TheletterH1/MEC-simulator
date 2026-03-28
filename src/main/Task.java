@@ -87,6 +87,10 @@ public class Task {
 		return baseTime;
 	}
 
+	public void setBaseTime(long baseTime) {
+		this.baseTime = baseTime;
+	}
+
 	public long getComputationalLoad() {
 		return computationalLoad;
 	}

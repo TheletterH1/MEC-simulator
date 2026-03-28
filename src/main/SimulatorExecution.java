@@ -30,6 +30,8 @@ import org.javatuples.Ennead;
 
 public class SimulatorExecution {
 
+	static java.util.Map<String, Integer> gibbsPolicies = new java.util.HashMap<>();
+
 	static int CORE_FREE = 1;
 	static int CORE_OCCUPIED = 2;
 
@@ -58,9 +60,9 @@ public class SimulatorExecution {
 
 		// Application 1
 		long taskGenerationRate = (long) (10 * Math.pow(10, 4));
-		long taskDataEntrySize = (long) (36.288 * 8 * Math.pow(10, 6));
+		long taskDataEntrySize = (long) (2.2 * 8 * Math.pow(10, 6));
 		long taskResultSize = (long) Math.pow(10, 4);
-		long computacionalLoadCPUcycles = (long) (20 * Math.pow(10, 6));
+		long computacionalLoadCPUcycles = (long) (200 * Math.pow(10, 6));
 		long deadlineCriticalTasks = (long) (0.5 * Math.pow(10, 6));
 		double percentageOfCriticalTasks = (double) 0.1;
 		appList.add(new Application("App1", taskGenerationRate, taskDataEntrySize, taskResultSize,
@@ -78,9 +80,9 @@ public class SimulatorExecution {
 		// deadlineCriticalTasks));
 
 		// Lists for number of tasks, IoT devices and MEC servers
-		List<Integer> listNumberOfTasks = Arrays.asList(500);
-		List<Integer> listNumberIoTDevices = Arrays.asList(100, 500, 1000);
-		List<Integer> listNumberMECServers = Arrays.asList(1, 2);
+		List<Integer> listNumberOfTasks = Arrays.asList(50);
+		List<Integer> listNumberIoTDevices = Arrays.asList(2);
+		List<Integer> listNumberMECServers = Arrays.asList(1);
 
 		for (int numberTasks : listNumberOfTasks) {
 			for (int numberIoTDevices : listNumberIoTDevices) {
@@ -132,15 +134,124 @@ public class SimulatorExecution {
 						// ---------------------------------------------------------------------------
 						// 3.1. Generate dependency map and initialize structures
 						// ---------------------------------------------------------------------------
-						Random rand = new Random();
-						double dependencyProbability = 0.3; // 30% chance of inter-task dependency
-						Map<Integer, List<String>> dependencyMap = Application.generateDependencies(
-								numberTasks, dependencyProbability, rand);
+						Random rand = new Random(42);
+						// double dependencyProbability = 0.3; // 30% chance of inter-task dependency
+						Map<Integer, List<String>> dependencyMap = new java.util.HashMap<>();
+
 						List<Task> waitingTasksQueue = new ArrayList<Task>(); // Tasks waiting on dependencies
 						Set<String> finishedTaskIds = new HashSet<String>(); // IDs of completed tasks
-						printMessageOnConsole(
-								"IUTD: Generated dependency DAG with probability " + dependencyProbability);
 
+						// --- GIBBS SAMPLING PRE-GENERATION ---
+						gibbsPolicies.clear(); // Reset for new loop
+						long[] randLoadList = new long[numberTasks];
+						long[] randDataList = new long[numberTasks];
+						for (int i = 0; i < numberTasks; i++) {
+							double loadFactor = 0.5 + rand.nextDouble();
+							randLoadList[i] = (long) (app.getComputationalLoad() * loadFactor);
+							randDataList[i] = (long) (app.getDataEntrySize() * loadFactor);
+						}
+
+						if (numberIoTDevices == 2) {
+							// --- Simulate task creation order to determine device assignment ---
+							// Device baseTime is random, so we can't assume even=Device-0.
+							// Instead, simulate the timing loop to find out which device creates each task.
+							int[] taskToDevice = new int[numberTasks];
+							int simCreated = 0;
+							long simTime = 0;
+							while (simCreated < numberTasks) {
+								for (int i = 0; i < numberIoTDevices && simCreated < numberTasks; i++) {
+									if (((simTime - listOfIoTDevices[i].getBaseTime()) % app.getRateGeneration()) == 0
+											&& simTime >= listOfIoTDevices[i].getBaseTime()) {
+										taskToDevice[simCreated] = i;
+										simCreated++;
+									}
+								}
+								simTime++;
+							}
+
+							// Count tasks per device
+							List<Integer> dev0Tasks = new ArrayList<>(); // WD1
+							List<Integer> dev1Tasks = new ArrayList<>(); // WD2
+							for (int i = 0; i < numberTasks; i++) {
+								if (taskToDevice[i] == 0)
+									dev0Tasks.add(i);
+								else
+									dev1Tasks.add(i);
+							}
+							int M = dev0Tasks.size(); // WD1 task count
+							int N = dev1Tasks.size(); // WD2 task count
+							int k = N / 2;
+
+							// --- Build intra-device sequential dependencies ---
+							// Each task depends on the previous task from the SAME device.
+							int[] lastTaskOnDevice = new int[numberIoTDevices];
+							Arrays.fill(lastTaskOnDevice, -1);
+							for (int i = 0; i < numberTasks; i++) {
+								int devId = taskToDevice[i];
+								if (lastTaskOnDevice[devId] >= 0) {
+									List<String> seqDeps = dependencyMap.getOrDefault(i, new ArrayList<>());
+									seqDeps.add("Task-" + lastTaskOnDevice[devId]);
+									dependencyMap.put(i, seqDeps);
+								}
+								lastTaskOnDevice[devId] = i;
+							}
+
+							// --- Add cross-device Gibbs dependency ---
+							// WD1's last task -> WD2's k-th task
+							int wd1LastGlobalId = dev0Tasks.get(M - 1);
+							int wd2KthGlobalId = dev1Tasks.get(k);
+							List<String> crossDeps = dependencyMap.getOrDefault(wd2KthGlobalId, new ArrayList<>());
+							crossDeps.add("Task-" + wd1LastGlobalId);
+							dependencyMap.put(wd2KthGlobalId, crossDeps);
+
+							printMessageOnConsole("IUTD: WD1(Device-0) has " + M + " tasks, WD2(Device-1) has " + N
+									+ " tasks, k=" + k + ", cross-dep: Task-" + wd1LastGlobalId + " -> Task-"
+									+ wd2KthGlobalId);
+
+							// --- Build task lists for Gibbs optimization ---
+							List<Task> wd1Tasks = new ArrayList<>();
+							List<Task> wd2Tasks = new ArrayList<>();
+							for (int i = 0; i < numberTasks; i++) {
+								int devId = taskToDevice[i];
+								Task t = new Task("Task-" + i, listOfIoTDevices[devId].getId(), -1, 0, randLoadList[i],
+										randDataList[i], app.getResultsSize());
+								if (devId == 0)
+									wd1Tasks.add(t);
+								else
+									wd2Tasks.add(t);
+							}
+							GibbsScheduler.MECSystemParams sysParam = new GibbsScheduler.MECSystemParams();
+							// Time-varying channels: model device moving closer to AP over time
+							// WD1: distance decreases from 100m to 30m across its tasks
+							double[] h1 = new double[wd1Tasks.size() + 1];
+							for (int i = 0; i <= wd1Tasks.size(); i++) {
+								double dist = 100.0 - (70.0 * i / wd1Tasks.size()); // 100m -> 30m
+								h1[i] = GibbsScheduler.freeSpaceChannel(dist, 4.11, 915e6, 3.0);
+							}
+							// WD2: distance decreases from 120m to 40m
+							double[] h2 = new double[wd2Tasks.size() + 1];
+							for (int i = 0; i <= wd2Tasks.size(); i++) {
+								double dist = 120.0 - (80.0 * i / wd2Tasks.size()); // 120m -> 40m
+								h2[i] = GibbsScheduler.freeSpaceChannel(dist, 4.11, 915e6, 3.0);
+							}
+							GibbsScheduler.WirelessDeviceWrapper wd1Wrap = new GibbsScheduler.WirelessDeviceWrapper(
+									listOfIoTDevices[0], wd1Tasks, h1, h1);
+							GibbsScheduler.WirelessDeviceWrapper wd2Wrap = new GibbsScheduler.WirelessDeviceWrapper(
+									listOfIoTDevices[1], wd2Tasks, h2, h2);
+
+							GibbsScheduler.GibbsResult gRes = GibbsScheduler.gibbsSampling(wd1Wrap, wd2Wrap, k,
+									sysParam, 1.0, 0.95, 500, 1e-6, 42);
+							for (int j = 0; j < M; j++)
+								gibbsPolicies.put(wd1Tasks.get(j).getIdTask(),
+										gRes.a1[j] == 0 ? POLICY1_IOT : POLICY2_MEC);
+							for (int j = 0; j < N; j++)
+								gibbsPolicies.put(wd2Tasks.get(j).getIdTask(),
+										gRes.a2[j] == 0 ? POLICY1_IOT : POLICY2_MEC);
+							printMessageOnConsole(
+									"IUTD: Sequential + Gibbs dependencies set. Best OBJ: " + gRes.bestObj);
+							printMessageOnConsole("IUTD: a1 (WD1) = " + Arrays.toString(gRes.a1));
+							printMessageOnConsole("IUTD: a2 (WD2) = " + Arrays.toString(gRes.a2));
+						}
 						// ---------------------------------------------------------------------------
 						// 4. Initiates simulation
 						// ---------------------------------------------------------------------------
@@ -157,10 +268,9 @@ public class SimulatorExecution {
 									// ---------------------------------------------------------------------------
 									Task newTask = new Task("TarefaDummy", "DeviceDummy", -1, 0, 0, 0, 0);
 									if (numberCreatedTasks < numberTasks) {
-										// Variable task cost logic: vary base parameters by +/- 50%
-										double loadFactor = 0.5 + rand.nextDouble(); // Random factor [0.5, 1.5]
-										long varLoad = (long) (app.getComputationalLoad() * loadFactor);
-										long varData = (long) (app.getDataEntrySize() * loadFactor);
+										// Task property fetched from pre-gen arrays to ensure consistency
+										long varLoad = randLoadList[numberCreatedTasks];
+										long varData = randDataList[numberCreatedTasks];
 
 										if (app.defineIfTaskIsCritical(numberCreatedTasks) == Boolean.TRUE) {
 											newTask = new Task("Task-" + numberCreatedTasks,
@@ -174,6 +284,7 @@ public class SimulatorExecution {
 													app.getResultsSize());
 										}
 
+										// IUTD: Assign dependencies from the pre-generated DAG
 										List<String> deps = dependencyMap.get(numberCreatedTasks);
 										if (deps != null) {
 											newTask.setDependencies(deps);
@@ -205,7 +316,7 @@ public class SimulatorExecution {
 									// ---------------------------------------------------------------------------
 									scheduleAndAllocateTask(newTask, listOfIoTDevices, listOfMECServers,
 											numberIoTDevices, numberMECServers, coefficientEnergy, coefficientTime,
-											alpha, beta, gamma, listRunningTasks, systemTime, i);
+											alpha, beta, gamma, listRunningTasks, systemTime, i, 0);
 
 									// ---------------------------------------------------------------------------
 									// Iteration end - Go back to 5.
@@ -227,6 +338,7 @@ public class SimulatorExecution {
 										numberTasksCanceledAndConcluded++;
 										listRunningTasks.remove(aux);
 
+										// IUTD: Record finished task ID for dependency tracking
 										finishedTaskIds.add(task.getIdTask());
 
 										// ---------------------------------------------------------------------------
@@ -235,18 +347,19 @@ public class SimulatorExecution {
 										if (task.getPolicy() == POLICY1_IOT) {
 											int id = Integer.parseInt(task.getIdDeviceGenerator().split("-")[1]);
 											listOfIoTDevices[id].alterCPUStatus(CORE_FREE);
-											task.setExecutionSite("IoT-" + id);
+											task.setExecutionSite("IoT-" + id); // IUTD: Record execution site
 										}
 										if (task.getPolicy() == POLICY2_MEC) {
+											// Fixed: Free core on the SPECIFIC server that processed it
 											listOfMECServers[task.getAssignedMECServerId()].freeCPU();
-											task.setExecutionSite("MEC-" + task.getAssignedMECServerId());
+											task.setExecutionSite("MEC-" + task.getAssignedMECServerId()); // IUTD
 										}
 										if (task.getPolicy() == POLICY3_CLOUD) {
-											task.setExecutionSite("Cloud");
+											task.setExecutionSite("Cloud"); // IUTD: Record execution site
 										}
 
 										if (Boolean.TRUE) {
-											if (numberTasksCanceledAndConcluded % 100 == 0)
+											if (numberTasksCanceledAndConcluded % 100 == 0) // Restrict prints
 												printMessageOnConsole("Number of tasks concluded: "
 														+ numberTasksCanceledAndConcluded);
 										}
@@ -268,10 +381,14 @@ public class SimulatorExecution {
 												// Find the device index from the task's device ID
 												int devIdx = Integer.parseInt(
 														waitingTask.getIdDeviceGenerator().split("-")[1]);
+
+												// Update basetime to current system time so it finishes properly
+												waitingTask.setBaseTime(systemTime);
+
 												scheduleAndAllocateTask(waitingTask, listOfIoTDevices,
 														listOfMECServers, numberIoTDevices, numberMECServers,
 														coefficientEnergy, coefficientTime, alpha, beta, gamma,
-														listRunningTasks, systemTime, devIdx);
+														listRunningTasks, systemTime, devIdx, 0);
 											}
 										}
 									}
@@ -313,14 +430,6 @@ public class SimulatorExecution {
 
 	}
 
-	public static void scheduleAndAllocateTask(Task task, IoTDevice[] listOfIoTDevices,
-			MECServer[] listOfMECServers, int numberIoTDevices, int numberMECServers,
-			double coefficientEnergy, double coefficientTime,
-			double alpha, double beta, double gamma,
-			List<Task> listRunningTasks, long systemTime, int deviceIndex) {
-
-	}
-
 	/*
 	 * Print message on console
 	 * 
@@ -350,10 +459,9 @@ public class SimulatorExecution {
 
 		filename = filename + "-" + testType + ".txt";
 
-		// Ennead<Time; Task-ID; Policy; Finalization Status, Energy CPU core, Energy
-		// data
-		// transmission, Time CPU core, Time data transmission, Cost>
-		List<Ennead<Long, String, String, String, Long, Long, Long, Long, Long>> listEnnead = new ArrayList<Ennead<Long, String, String, String, Long, Long, Long, Long, Long>>();
+		BufferedWriter writer = new BufferedWriter(new FileWriter(filename));
+		String header = "Time;Task-ID;Device;Policy;Finalization Status;CPU core Energy;Transfer Energy;CPU core Time;Transfer Time;Cost\n";
+		writer.write(header);
 
 		for (int i = 0; i < tasksFinalized.length; i++) {
 			String policy;
@@ -370,26 +478,20 @@ public class SimulatorExecution {
 			else
 				statusFinalizacao = "TASK_CANCELED";
 
-			Ennead<Long, String, String, String, Long, Long, Long, Long, Long> ennead = new Ennead<Long, String, String, String, Long, Long, Long, Long, Long>(
-					(long) (tasksFinalized[i].getBaseTime() + tasksFinalized[i].getTotalElapsedTime()),
-					tasksFinalized[i].getIdTask(),
-					policy,
-					statusFinalizacao,
-					(long) tasksFinalized[i].getExecutionEnergy(),
-					(long) tasksFinalized[i].getTransferEnergy(),
-					tasksFinalized[i].getExecutionTime(),
-					tasksFinalized[i].getTransferTime(),
-					(long) (coefficientEnergy * tasksFinalized[i].getTotalConsumedEnergy()
-							+ coefficientTime * tasksFinalized[i].getTotalElapsedTime()));
+			long time = (long) (tasksFinalized[i].getBaseTime() + tasksFinalized[i].getTotalElapsedTime());
+			long cost = (long) (coefficientEnergy * tasksFinalized[i].getTotalConsumedEnergy()
+					+ coefficientTime * tasksFinalized[i].getTotalElapsedTime());
 
-			listEnnead.add(ennead);
+			writer.write(time + ";" + tasksFinalized[i].getIdTask() + ";"
+					+ tasksFinalized[i].getIdDeviceGenerator() + ";" + policy + ";"
+					+ statusFinalizacao + ";"
+					+ (long) tasksFinalized[i].getExecutionEnergy() + ";"
+					+ (long) tasksFinalized[i].getTransferEnergy() + ";"
+					+ tasksFinalized[i].getExecutionTime() + ";"
+					+ tasksFinalized[i].getTransferTime() + ";"
+					+ cost + "\n");
 		}
-
-		// Order tuple list by the tasks finalization time
-		listEnnead.sort(null);
-
-		String header = "Time;Task-ID;Policy;Finalization Status;CPU core Energy;Transfer Energy;CPU core Time;Transfer Time;Cost\n";
-		printEnneadsToFile(filename, header, listEnnead);
+		writer.close();
 	}
 
 	/*
@@ -421,5 +523,73 @@ public class SimulatorExecution {
 					ennead.getValue6() + ";" + ennead.getValue7() + ";" + ennead.getValue8() + "\n");
 		}
 		writer.close();
+	}
+
+	public static void scheduleAndAllocateTask(Task task, IoTDevice[] listIoTDevices,
+			MECServer[] listMECServers, int numberIoTDevices, int numberMECServers, double coefficientEnergy,
+			double coefficientTime,
+			double alpha, double beta, double gamma, List<Task> listRunningTasks, long systemTime, int devIdx,
+			int specialCase) {
+
+		if (specialCase == 1) {
+			// Force all to IoT
+			task.setPolicy(POLICY1_IOT);
+		} else if (specialCase == 2) {
+			// Force all to MEC
+			task.setPolicy(POLICY2_MEC);
+		}
+		int policyToApply;
+		if (gibbsPolicies.containsKey(task.getIdTask())) {
+			policyToApply = gibbsPolicies.get(task.getIdTask());
+		} else {
+			boolean flagIoTDevice = listIoTDevices[devIdx].verifyCPUFree() == Boolean.TRUE;
+			boolean flagMECServer = false;
+			for (MECServer mec : listMECServers) {
+				if (mec.verifyCPUFree() == Boolean.TRUE) {
+					flagMECServer = true;
+					break;
+				}
+			}
+			Scheduler scheduler = new Scheduler(task, coefficientEnergy, coefficientTime, alpha, beta, gamma);
+			Octet<Double, Double, Double, Double, Double, Long, Double, Integer> allocation = scheduler
+					.defineAllocationPolicy(flagIoTDevice, flagMECServer);
+			policyToApply = allocation.getValue7();
+		}
+
+		task.setPolicy(policyToApply);
+
+		if (policyToApply == POLICY1_IOT) {
+			listIoTDevices[devIdx].alterCPUStatus(CORE_OCCUPIED);
+			long freq = listIoTDevices[devIdx].getPairsFrequencyVoltage().get(0).getValue0();
+			double volt = listIoTDevices[devIdx].getPairsFrequencyVoltage().get(0).getValue1();
+			task.setExecutionTime(listIoTDevices[devIdx].calculateExecutionTime(freq, task.getComputationalLoad()));
+			task.setExecutionEnergy(
+					listIoTDevices[devIdx].calculateDynamicEnergyConsumed(freq, volt, task.getComputationalLoad()));
+			task.setTransferTime(0);
+			task.setTransferEnergy(0);
+		} else if (policyToApply == POLICY2_MEC) {
+			int targetMec = 0;
+			for (int j = 0; j < numberMECServers; j++) {
+				if (listMECServers[j].verifyCPUFree() == Boolean.TRUE) {
+					targetMec = j;
+					break;
+				}
+			}
+			task.setAssignedMECServerId(targetMec);
+			listMECServers[targetMec].ocuppyCPU();
+
+			long freq = listMECServers[targetMec].getPairsFrenquecyVoltage().get(0).getValue0();
+			double volt = listMECServers[targetMec].getPairsFrenquecyVoltage().get(0).getValue1();
+			task.setExecutionTime(listMECServers[targetMec].calculateExecutionTime(freq, task.getComputationalLoad()));
+			task.setExecutionEnergy(
+					listMECServers[targetMec].calculateDynamicEnergyConsumed(freq, volt, task.getComputationalLoad()));
+
+			RAN_5G ran = new RAN_5G();
+			task.setTransferTime(ran.calculateTransferTime(task.getEntryDataSize())
+					+ ran.calculateTransferTime(task.getReturnDataSize()));
+			task.setTransferEnergy(ran.calculateConsumedEnergy(task.getEntryDataSize())
+					+ ran.calculateConsumedEnergy(task.getReturnDataSize()));
+		}
+		listRunningTasks.add(task);
 	}
 }
