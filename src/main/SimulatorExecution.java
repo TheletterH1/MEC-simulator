@@ -32,6 +32,8 @@ public class SimulatorExecution {
 
 	public static java.util.Map<String, Integer> gibbsPolicies = new java.util.HashMap<>();
 	public static double gibbsBestObj = 0.0;
+	public static boolean SMART_ONLINE_FALLBACK = true;
+	public static int[] lastPolicyPerDevice;
 
 	static int CORE_FREE = 1;
 	static int CORE_OCCUPIED = 2;
@@ -144,6 +146,8 @@ public class SimulatorExecution {
 
 						// --- GIBBS SAMPLING PRE-GENERATION ---
 						gibbsPolicies.clear(); // Reset for new loop
+						lastPolicyPerDevice = new int[numberIoTDevices];
+						Arrays.fill(lastPolicyPerDevice, POLICY1_IOT); // Initial data location is the IoT device
 						long[] randLoadList = new long[numberTasks];
 						long[] randDataList = new long[numberTasks];
 						long minLoad = (long) (10 * Math.pow(10, 6)); // 10 Mcycles
@@ -223,14 +227,20 @@ public class SimulatorExecution {
 									wd2Tasks.add(t);
 							}
 							GibbsScheduler.MECSystemParams sysParam = new GibbsScheduler.MECSystemParams();
-							// Paper Fig 8/9 setup: d1=15m, d2=10m.
-							double d1 = 15.0;
+							// Time-varying channels: model device moving closer to AP over time
+							// WD1: distance decreases from 60m to 10m across its tasks
 							double[] h1 = new double[wd1Tasks.size() + 1];
-							Arrays.fill(h1, GibbsScheduler.freeSpaceChannel(d1, 4.11, 915e6, 3.0));
+							for (int i = 0; i <= wd1Tasks.size(); i++) {
+								double dist = 60.0 - (50.0 * i / wd1Tasks.size()); // 60m -> 10m
+								h1[i] = GibbsScheduler.freeSpaceChannel(dist, 4.11, 915e6, 3.0);
+							}
 
-							double d2 = 10.0;
+							// WD2: distance decreases from 80m to 20m
 							double[] h2 = new double[wd2Tasks.size() + 1];
-							Arrays.fill(h2, GibbsScheduler.freeSpaceChannel(d2, 4.11, 915e6, 3.0));
+							for (int i = 0; i <= wd2Tasks.size(); i++) {
+								double dist = 80.0 - (60.0 * i / wd2Tasks.size()); // 80m -> 20m
+								h2[i] = GibbsScheduler.freeSpaceChannel(dist, 4.11, 915e6, 3.0);
+							}
 
 							GibbsScheduler.WirelessDeviceWrapper wd1Wrap = new GibbsScheduler.WirelessDeviceWrapper(
 									listOfIoTDevices[0], wd1Tasks, h1, h1);
@@ -563,7 +573,52 @@ public class SimulatorExecution {
 			policyToApply = allocation.getValue7();
 		}
 
+		// The network is fast initially, but gracefully crashes at T = 800s
+		boolean networkIsBad = SMART_ONLINE_FALLBACK && systemTime > 800_000_000L;
+
+		if (SMART_ONLINE_FALLBACK && policyToApply == POLICY2_MEC) {
+			// Dynamically evaluate true online cost before blindly committing to MEC
+			long freqIoT = listIoTDevices[devIdx].getPairsFrequencyVoltage().get(0).getValue0();
+			double voltIoT = listIoTDevices[devIdx].getPairsFrequencyVoltage().get(0).getValue1();
+			double tIoT = listIoTDevices[devIdx].calculateExecutionTime(freqIoT, task.getComputationalLoad());
+			double eIoT = listIoTDevices[devIdx].calculateDynamicEnergyConsumed(freqIoT, voltIoT,
+					task.getComputationalLoad());
+
+			// Assume it must download if it falls back to IoT after a MEC task
+			double fallbackTransTime = 0, fallbackTransEnergy = 0;
+			if (lastPolicyPerDevice[devIdx] == POLICY2_MEC) {
+				RAN_5G ranFail = new RAN_5G();
+				ranFail.setTransferRate((long) Math.pow(10, 5));
+				fallbackTransTime = ranFail.calculateTransferTime(task.getEntryDataSize());
+				fallbackTransEnergy = ranFail.calculateConsumedEnergy(task.getEntryDataSize());
+			}
+			double costIoTLocal = coefficientTime * (tIoT + fallbackTransTime)
+					+ coefficientEnergy * (eIoT + fallbackTransEnergy);
+
+			long freqMEC = listMECServers[0].getPairsFrenquecyVoltage().get(0).getValue0();
+			double voltMEC = listMECServers[0].getPairsFrenquecyVoltage().get(0).getValue1();
+			double tMEC = listMECServers[0].calculateExecutionTime(freqMEC, task.getComputationalLoad());
+			double eMEC = listMECServers[0].calculateDynamicEnergyConsumed(freqMEC, voltMEC,
+					task.getComputationalLoad());
+
+			double tTrans = 0, eTrans = 0;
+			if (lastPolicyPerDevice[devIdx] == POLICY1_IOT) {
+				RAN_5G ranCheck = new RAN_5G();
+				ranCheck.setTransferRate((long) Math.pow(10, 5)); // Degraded network
+				tTrans = ranCheck.calculateTransferTime(task.getEntryDataSize());
+				eTrans = ranCheck.calculateConsumedEnergy(task.getEntryDataSize());
+			}
+			double costMecOnline = coefficientTime * (tMEC + tTrans) + coefficientEnergy * (eMEC + eTrans);
+
+			if (costMecOnline > costIoTLocal) {
+				policyToApply = POLICY1_IOT; // Switch to IoT because MEC is literally more expensive online
+			}
+		}
+
 		task.setPolicy(policyToApply);
+
+		int lastPolicy = lastPolicyPerDevice[devIdx];
+		lastPolicyPerDevice[devIdx] = policyToApply;
 
 		if (policyToApply == POLICY1_IOT) {
 			listIoTDevices[devIdx].alterCPUStatus(CORE_OCCUPIED);
@@ -572,8 +627,22 @@ public class SimulatorExecution {
 			task.setExecutionTime(listIoTDevices[devIdx].calculateExecutionTime(freq, task.getComputationalLoad()));
 			task.setExecutionEnergy(
 					listIoTDevices[devIdx].calculateDynamicEnergyConsumed(freq, volt, task.getComputationalLoad()));
-			task.setTransferTime(0);
-			task.setTransferEnergy(0);
+
+			if (lastPolicy == POLICY2_MEC) {
+				// The task must process locally, but the data is stuck on the Edge from the
+				// previous task!
+				// We must pay the download penalty over the severely degraded network before
+				// starting.
+				RAN_5G ran = new RAN_5G();
+				if (networkIsBad)
+					ran.setTransferRate((long) Math.pow(10, 5));
+				task.setTransferTime(ran.calculateTransferTime(task.getEntryDataSize()));
+				task.setTransferEnergy(ran.calculateConsumedEnergy(task.getEntryDataSize()));
+			} else {
+				// Consecutive local tasks: Data is already here.
+				task.setTransferTime(0);
+				task.setTransferEnergy(0);
+			}
 		} else if (policyToApply == POLICY2_MEC) {
 			int targetMec = 0;
 			for (int j = 0; j < numberMECServers; j++) {
@@ -591,11 +660,19 @@ public class SimulatorExecution {
 			task.setExecutionEnergy(
 					listMECServers[targetMec].calculateDynamicEnergyConsumed(freq, volt, task.getComputationalLoad()));
 
-			RAN_5G ran = new RAN_5G();
-			task.setTransferTime(ran.calculateTransferTime(task.getEntryDataSize())
-					+ ran.calculateTransferTime(task.getReturnDataSize()));
-			task.setTransferEnergy(ran.calculateConsumedEnergy(task.getEntryDataSize())
-					+ ran.calculateConsumedEnergy(task.getReturnDataSize()));
+			if (lastPolicy == POLICY1_IOT) {
+				// The data is currently on the IoT device, we must pay the upload penalty.
+				RAN_5G ran = new RAN_5G();
+				if (SMART_ONLINE_FALLBACK)
+					ran.setTransferRate((long) Math.pow(10, 5));
+				task.setTransferTime(ran.calculateTransferTime(task.getEntryDataSize()));
+				task.setTransferEnergy(ran.calculateConsumedEnergy(task.getEntryDataSize()));
+			} else {
+				// True Data Locality: The previous task was on the MEC, so the data is already
+				// on the server!
+				task.setTransferTime(0);
+				task.setTransferEnergy(0);
+			}
 		}
 		listRunningTasks.add(task);
 	}
