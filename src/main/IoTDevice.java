@@ -13,6 +13,7 @@ public class IoTDevice {
 	private String id;
 	private double capacitance; // Chipset capacitance
 	private double powerIdle; // Power when CPU in idle
+	private double maxBattery;
 	private double batteryLevel; // In W * (micro second)
 	private double ISL; // In W * (micro second) - Inferior Safety Limit
 
@@ -42,9 +43,9 @@ public class IoTDevice {
 
 		this.capacitance = (double) (2.2 * Math.pow(10, -9)); // In Farads
 		this.powerIdle = (double) (900 * Math.pow(10, -6)); // In W
-		this.batteryLevel = 36000 * Math.pow(10, 6); // 36000 Ws - Equivalent to 36000*10^6 W*micro-second, 10Wh or
-														// 2000mAh with 5V
-		this.ISL = batteryLevel * 0.1; // ISL is 10% of maximum battery capacity
+		this.maxBattery = 30000000;
+		this.batteryLevel = this.maxBattery; // * 0.27;
+		this.ISL = this.maxBattery * 0.05; // ISL is 5% of maximum battery capacity
 
 		// Operating frequencies for Arduino Mega 2560
 		this.pairsFrequencyVoltage.add(new Pair<Long, Double>((long) (1 * Math.pow(10, 6)), 1.8));
@@ -71,6 +72,18 @@ public class IoTDevice {
 
 	public double getBatteryLevel() {
 		return this.batteryLevel;
+	}
+
+	public double getMaxBattery() {
+		return this.maxBattery;
+	}
+
+	public double getISL() {
+		return this.ISL;
+	}
+
+	public void setBatteryLevel(double newLevel) {
+		this.batteryLevel = newLevel;
 	}
 
 	/*
@@ -126,6 +139,9 @@ public class IoTDevice {
 	 */
 	public void consumeBaterry(double consumedEnergy) {
 		this.batteryLevel = this.batteryLevel - consumedEnergy;
+		if (this.batteryLevel < 0) {
+			this.batteryLevel = 0;
+		}
 	}
 
 	/*

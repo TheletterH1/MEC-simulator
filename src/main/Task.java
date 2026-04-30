@@ -23,6 +23,8 @@ public class Task {
 	private double energyTransfer; // In W*micro-seconds
 	private long timeExecution; // In micro seconds
 	private long timeTransfer; // In micro seconds
+	private double remainingBattery;
+	private boolean killedByBattery;
 
 	private static int TASK_ALIVE = 1; // Task being allocated and executed
 	private static int TASK_CONCLUDED = 2; // Task is concluded. If task is critical, it will be concluded if task
@@ -60,6 +62,8 @@ public class Task {
 		this.energyTransfer = 0;
 		this.timeExecution = 0;
 		this.timeTransfer = 0;
+		this.remainingBattery = 0;
+		this.killedByBattery = false;
 		this.taskStatus = TASK_ALIVE;
 		this.assignedMECServerId = -1;
 		this.dependencies = new ArrayList<>();
@@ -150,6 +154,22 @@ public class Task {
 	public long getTransferTime() {
 		return timeTransfer;
 	}
+	
+	public double getRemainingBattery() {
+		return remainingBattery;
+	}
+
+	public void setRemainingBattery(double remainingBattery) {
+		this.remainingBattery = remainingBattery;
+	}
+
+	public void killByBattery() {
+		this.killedByBattery = true;
+	}
+
+	public boolean isKilledByBattery() {
+		return this.killedByBattery;
+	}
 
 	/* Setters */
 	public void setExecutionEnergy(double executionEnergy) {
@@ -225,6 +245,11 @@ public class Task {
 	 * 
 	 */
 	private void finalizeTask(long systemTime) {
+		if (this.killedByBattery) {
+			this.taskStatus = TASK_CALCELLED;
+			return;
+		}
+
 		if (this.deadline == -1)
 			this.taskStatus = TASK_CONCLUDED;
 		else if (systemTime < (this.baseTime + this.deadline))

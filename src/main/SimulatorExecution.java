@@ -67,7 +67,7 @@ public class SimulatorExecution {
 		long taskResultSize = (long) Math.pow(10, 4);
 		long computacionalLoadCPUcycles = (long) (200 * Math.pow(10, 6));
 		long deadlineCriticalTasks = (long) (0.5 * Math.pow(10, 6));
-		double percentageOfCriticalTasks = (double) 0.1;
+		double percentageOfCriticalTasks = (double) 0.5;
 		appList.add(new Application("App1", taskGenerationRate, taskDataEntrySize, taskResultSize,
 				computacionalLoadCPUcycles, percentageOfCriticalTasks, deadlineCriticalTasks));
 
@@ -476,7 +476,7 @@ public class SimulatorExecution {
 		BufferedWriter writer = new BufferedWriter(new FileWriter(filename));
 		writer.write("# Total ETC (Gibbs Best OBJ): " + gibbsBestObj + "\n");
 
-		String header = "Time;Task-ID;Device;Policy;Finalization Status;CPU core Energy;Transfer Energy;CPU core Time;Transfer Time;Cost\n";
+		String header = "Time;Task-ID;Device;Policy;Finalization Status;Criticality;Remaining Battery;CPU core Energy;Transfer Energy;CPU core Time;Transfer Time;Cost\n";
 		writer.write(header);
 
 		for (int i = 0; i < tasksFinalized.length; i++) {
@@ -498,9 +498,13 @@ public class SimulatorExecution {
 			long cost = (long) (coefficientEnergy * tasksFinalized[i].getTotalConsumedEnergy()
 					+ coefficientTime * tasksFinalized[i].getTotalElapsedTime());
 
+			String isCriticalString = tasksFinalized[i].verifyIfTaskIsCritical() ? "CRITICAL" : "NON_CRITICAL";
+
 			writer.write(time + ";" + tasksFinalized[i].getIdTask() + ";"
 					+ tasksFinalized[i].getIdDeviceGenerator() + ";" + policy + ";"
 					+ statusFinalizacao + ";"
+					+ isCriticalString + ";"
+					+ (long) tasksFinalized[i].getRemainingBattery() + ";"
 					+ (long) tasksFinalized[i].getExecutionEnergy() + ";"
 					+ (long) tasksFinalized[i].getTransferEnergy() + ";"
 					+ tasksFinalized[i].getExecutionTime() + ";"
@@ -548,6 +552,23 @@ public class SimulatorExecution {
 			double alpha, double beta, double gamma, List<Task> listRunningTasks, long systemTime, int devIdx,
 			int specialCase) {
 
+		// Guard Rail: If the device is completely dead (battery <= ISL), it cannot
+		// process or offload
+		if (listIoTDevices[devIdx].getBatteryLevel() <= listIoTDevices[devIdx].getISL()) {
+			task.killByBattery();
+			// Set execution time to 1 us so it instantly concludes in the next loop and
+			// gets marked TASK_CALCELLED
+			long waitTime = (systemTime >= task.getBaseTime()) ? (systemTime - task.getBaseTime() + 1) : 1;
+			task.setExecutionTime(waitTime);
+			task.setTransferTime(0);
+			task.setExecutionEnergy(0);
+			task.setTransferEnergy(0);
+			task.setRemainingBattery(listIoTDevices[devIdx].getBatteryLevel());
+			task.setPolicy(1);
+			listRunningTasks.add(task);
+			return;
+		}
+
 		if (specialCase == 1) {
 			// Force all to IoT
 			task.setPolicy(POLICY1_IOT);
@@ -576,8 +597,8 @@ public class SimulatorExecution {
 		// The network is fast initially, but gracefully crashes at T = 800s
 		boolean networkIsBad = SMART_ONLINE_FALLBACK && systemTime > 800_000_000L;
 
-		if (SMART_ONLINE_FALLBACK && policyToApply == POLICY2_MEC) {
-			// Dynamically evaluate true online cost before blindly committing to MEC
+		if (SMART_ONLINE_FALLBACK) {
+			// Dynamically evaluate true online costs before blindly committing
 			long freqIoT = listIoTDevices[devIdx].getPairsFrequencyVoltage().get(0).getValue0();
 			double voltIoT = listIoTDevices[devIdx].getPairsFrequencyVoltage().get(0).getValue1();
 			double tIoT = listIoTDevices[devIdx].calculateExecutionTime(freqIoT, task.getComputationalLoad());
@@ -585,15 +606,16 @@ public class SimulatorExecution {
 					task.getComputationalLoad());
 
 			// Assume it must download if it falls back to IoT after a MEC task
-			double fallbackTransTime = 0, fallbackTransEnergy = 0;
+			double fallbackTransTimeDown = 0, fallbackTransEnergyDown = 0;
 			if (lastPolicyPerDevice[devIdx] == POLICY2_MEC) {
 				RAN_5G ranFail = new RAN_5G();
-				ranFail.setTransferRate((long) Math.pow(10, 5));
-				fallbackTransTime = ranFail.calculateTransferTime(task.getEntryDataSize());
-				fallbackTransEnergy = ranFail.calculateConsumedEnergy(task.getEntryDataSize());
+				if (networkIsBad)
+					ranFail.setTransferRate((long) Math.pow(10, 5));
+				fallbackTransTimeDown = ranFail.calculateTransferTime(task.getEntryDataSize());
+				fallbackTransEnergyDown = ranFail.calculateConsumedEnergy(task.getEntryDataSize());
 			}
-			double costIoTLocal = coefficientTime * (tIoT + fallbackTransTime)
-					+ coefficientEnergy * (eIoT + fallbackTransEnergy);
+			double costIoTLocal = coefficientTime * (tIoT + fallbackTransTimeDown)
+					+ coefficientEnergy * (eIoT + fallbackTransEnergyDown);
 
 			long freqMEC = listMECServers[0].getPairsFrenquecyVoltage().get(0).getValue0();
 			double voltMEC = listMECServers[0].getPairsFrenquecyVoltage().get(0).getValue1();
@@ -601,17 +623,70 @@ public class SimulatorExecution {
 			double eMEC = listMECServers[0].calculateDynamicEnergyConsumed(freqMEC, voltMEC,
 					task.getComputationalLoad());
 
-			double tTrans = 0, eTrans = 0;
+			double tTransUp = 0, eTransUp = 0;
 			if (lastPolicyPerDevice[devIdx] == POLICY1_IOT) {
 				RAN_5G ranCheck = new RAN_5G();
-				ranCheck.setTransferRate((long) Math.pow(10, 5)); // Degraded network
-				tTrans = ranCheck.calculateTransferTime(task.getEntryDataSize());
-				eTrans = ranCheck.calculateConsumedEnergy(task.getEntryDataSize());
+				if (networkIsBad)
+					ranCheck.setTransferRate((long) Math.pow(10, 5)); // Degraded network
+				tTransUp = ranCheck.calculateTransferTime(task.getEntryDataSize());
+				eTransUp = ranCheck.calculateConsumedEnergy(task.getEntryDataSize());
 			}
-			double costMecOnline = coefficientTime * (tMEC + tTrans) + coefficientEnergy * (eMEC + eTrans);
+			double costMecOnline = coefficientTime * (tMEC + tTransUp) + coefficientEnergy * (eMEC + eTransUp);
 
-			if (costMecOnline > costIoTLocal) {
-				policyToApply = POLICY1_IOT; // Switch to IoT because MEC is literally more expensive online
+			// 1. Variable: Battery Level Monitoring
+			double maxBattery = listIoTDevices[devIdx].getMaxBattery();
+			double currentBattery = listIoTDevices[devIdx].getBatteryLevel();
+			boolean batteryIsLow = currentBattery < (maxBattery * 0.20); // Warning at < 20%
+
+			// 2. Variable: Task Criticality (Deadline) Monitoring
+			boolean isCritical = task.verifyIfTaskIsCritical();
+
+			// MANUAL FLAGS TO TEST SPECIFIC SCENARIOS
+			// SET OTHERS TO FALSE TO TEST EACH CASE
+			// isCritical = false;
+			// networkIsBad = false;
+			// batteryIsLow = false;
+
+			// Smart Fallback Override Logic:
+			if (isCritical) {
+				// Critical task: strictly optimize for TIME, ignoring energy cost
+				double totalTimeIoT = tIoT + fallbackTransTimeDown;
+				double totalTimeMEC = tMEC + tTransUp;
+				if (totalTimeMEC > totalTimeIoT) {
+					policyToApply = POLICY1_IOT;
+				} else if (totalTimeIoT > totalTimeMEC) {
+					policyToApply = POLICY2_MEC;
+				}
+			} else if (batteryIsLow) {
+				// Low battery state: strictly optimize for ENERGY to prevent device death
+				double totalEnergyIoT = eIoT + fallbackTransEnergyDown;
+				double totalEnergyMEC = eMEC + eTransUp;
+				if (totalEnergyMEC > totalEnergyIoT) {
+					policyToApply = POLICY1_IOT;
+				} else if (totalEnergyIoT > totalEnergyMEC) {
+					policyToApply = POLICY2_MEC;
+				}
+			} else if (networkIsBad) {
+				// Standard blended cost logic from network conditions
+				if (policyToApply == POLICY2_MEC && costMecOnline > costIoTLocal) {
+					policyToApply = POLICY1_IOT; // Switch to IoT because MEC is more expensive online
+				} else if (policyToApply == POLICY1_IOT && costIoTLocal > costMecOnline) {
+					policyToApply = POLICY2_MEC; // Switch to MEC because IoT is more expensive online
+				}
+			}
+
+			// Honorable mention: Check MEC Availability
+			if (policyToApply == POLICY2_MEC) {
+				boolean mecAvail = false;
+				for (MECServer mec : listMECServers) {
+					if (mec.verifyCPUFree() == Boolean.TRUE) {
+						mecAvail = true;
+						break;
+					}
+				}
+				if (!mecAvail) {
+					policyToApply = POLICY1_IOT; // MEC is fully occupied, avoid queuing time
+				}
 			}
 		}
 
@@ -629,20 +704,17 @@ public class SimulatorExecution {
 					listIoTDevices[devIdx].calculateDynamicEnergyConsumed(freq, volt, task.getComputationalLoad()));
 
 			if (lastPolicy == POLICY2_MEC) {
-				// The task must process locally, but the data is stuck on the Edge from the
-				// previous task!
-				// We must pay the download penalty over the severely degraded network before
-				// starting.
 				RAN_5G ran = new RAN_5G();
 				if (networkIsBad)
 					ran.setTransferRate((long) Math.pow(10, 5));
 				task.setTransferTime(ran.calculateTransferTime(task.getEntryDataSize()));
 				task.setTransferEnergy(ran.calculateConsumedEnergy(task.getEntryDataSize()));
 			} else {
-				// Consecutive local tasks: Data is already here.
 				task.setTransferTime(0);
 				task.setTransferEnergy(0);
 			}
+
+			listIoTDevices[devIdx].consumeBaterry(task.getExecutionEnergy() + task.getTransferEnergy());
 		} else if (policyToApply == POLICY2_MEC) {
 			int targetMec = 0;
 			for (int j = 0; j < numberMECServers; j++) {
@@ -661,19 +733,20 @@ public class SimulatorExecution {
 					listMECServers[targetMec].calculateDynamicEnergyConsumed(freq, volt, task.getComputationalLoad()));
 
 			if (lastPolicy == POLICY1_IOT) {
-				// The data is currently on the IoT device, we must pay the upload penalty.
 				RAN_5G ran = new RAN_5G();
-				if (SMART_ONLINE_FALLBACK)
+				if (networkIsBad)
 					ran.setTransferRate((long) Math.pow(10, 5));
 				task.setTransferTime(ran.calculateTransferTime(task.getEntryDataSize()));
 				task.setTransferEnergy(ran.calculateConsumedEnergy(task.getEntryDataSize()));
 			} else {
-				// True Data Locality: The previous task was on the MEC, so the data is already
-				// on the server!
 				task.setTransferTime(0);
 				task.setTransferEnergy(0);
 			}
+
+			listIoTDevices[devIdx].consumeBaterry(task.getTransferEnergy());
 		}
+
+		task.setRemainingBattery(listIoTDevices[devIdx].getBatteryLevel());
 		listRunningTasks.add(task);
 	}
 }
